@@ -1,0 +1,18 @@
+# pubspec.yaml
+name: fake_currency_detector
+version: 1.0.0+1
+environment:
+  sdk: ">=2.17.0 <3.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  image_picker: ^1.2.0
+  tflite_flutter: ^0.11.0
+  image: ^4.0.17
+  permission_handler: ^11.0.1
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/model.tflite
