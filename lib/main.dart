@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart' as img;
@@ -46,6 +47,7 @@ class _DetectScreenState extends State<DetectScreen> {
   String? _result;
   bool _isLoading = false;
   bool _isModelLoaded = false;
+  bool _isModelLoading = false; // Prevent multiple loading attempts
   Color _resultColor = Colors.black;
 
   // Model input dimensions (adjust based on your trained model)
@@ -54,42 +56,253 @@ class _DetectScreenState extends State<DetectScreen> {
   @override
   void initState() {
     super.initState();
-    _loadModel();
+    _initializeApp();
+  }
+
+  Future<void> _initializeApp() async {
+    // First check if the model asset exists
+    bool assetExists = await _checkModelAssetExists();
+    if (!assetExists) {
+      setState(() {
+        _result = 'Error: model.tflite not found in assets. Please check your pubspec.yaml configuration.';
+        _resultColor = Colors.red;
+      });
+      return;
+    }
+    
+    // Proceed with model loading
+    await _loadModel();
+  }
+
+  Future<bool> _checkModelAssetExists() async {
+    try {
+      final ByteData data = await rootBundle.load('assets/model.tflite');
+      print('Model asset found: ${data.lengthInBytes} bytes');
+      return true;
+    } catch (e) {
+      print('Model asset not found: $e');
+      return false;
+    }
   }
 
   @override
   void dispose() {
-    _interpreter?.close();
+    // Ensure proper cleanup of resources
+    try {
+      _interpreter?.close();
+      _interpreter = null;
+    } catch (e) {
+      print('Error disposing interpreter: $e');
+    }
     super.dispose();
   }
 
   Future<void> _loadModel() async {
+    // Prevent multiple simultaneous loading attempts
+    if (_isModelLoading) {
+      print('Model loading already in progress');
+      return;
+    }
+
     try {
       setState(() {
+        _isModelLoading = true;
         _isLoading = true;
         _result = 'Loading AI model...';
       });
       
-      _interpreter = await Interpreter.fromAsset('model.tflite');
+      // Dispose existing interpreter if any
+      if (_interpreter != null) {
+        try {
+          _interpreter!.close();
+        } catch (e) {
+          print('Error closing existing interpreter: $e');
+        }
+        _interpreter = null;
+      }
+      
+      // Force garbage collection to free memory
+      await Future.delayed(const Duration(milliseconds: 200));
+      
+      // Load the model with enhanced retry mechanism
+      _interpreter = await _loadModelWithEnhancedRetry();
+      
+      // Verify the interpreter is properly loaded
+      if (_interpreter == null) {
+        throw Exception('Failed to create interpreter instance');
+      }
+      
+      // Test the interpreter with a dummy inference to ensure it's working
+      await _testModelInference();
       
       // Print model input/output details for debugging
-      print('Model loaded successfully');
+      print('Model loaded and tested successfully');
       print('Input shape: ${_interpreter!.getInputTensor(0).shape}');
       print('Output shape: ${_interpreter!.getOutputTensor(0).shape}');
       
       setState(() {
         _isModelLoaded = true;
         _isLoading = false;
+        _isModelLoading = false;
         _result = 'Model loaded successfully! Ready to detect ₹500 notes.';
         _resultColor = Colors.green;
       });
     } catch (e) {
+      // Clean up on failure
+      try {
+        _interpreter?.close();
+      } catch (closeError) {
+        print('Error during cleanup: $closeError');
+      }
+      _interpreter = null;
+      
       setState(() {
         _isLoading = false;
-        _result = 'Error loading model: $e';
+        _isModelLoading = false;
+        _isModelLoaded = false;
+        _result = 'Error loading model: $e\n\nTap "Reload AI Model" to try again.';
         _resultColor = Colors.red;
       });
       print('Model loading error: $e');
+    }
+  }
+
+  Future<Interpreter> _loadModelWithEnhancedRetry() async {
+    const int maxRetries = 5;
+    const Duration baseDelay = Duration(milliseconds: 500);
+    
+    Exception? lastException;
+    
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        print('Loading model attempt $attempt/$maxRetries');
+        
+        Interpreter interpreter;
+        
+        if (attempt == 1) {
+          // Primary: Load via ByteData (most reliable approach)
+          interpreter = await _loadModelFromByteData();
+        } else {
+          // Fallback: Standard asset loading
+          interpreter = await Interpreter.fromAsset('model.tflite');
+        }
+        
+        return interpreter;
+        
+      } catch (e) {
+        lastException = e is Exception ? e : Exception(e.toString());
+        print('Model loading attempt $attempt failed: $e');
+        
+        if (attempt < maxRetries) {
+          // Exponential backoff with some randomization
+          final delay = Duration(
+            milliseconds: baseDelay.inMilliseconds * attempt + 
+                         (math.Random().nextInt(200))
+          );
+          await Future.delayed(delay);
+          
+          // Force garbage collection between attempts
+          print('Attempting garbage collection...');
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
+      }
+    }
+    
+    throw lastException ?? Exception('Failed to load model after $maxRetries attempts');
+  }
+
+  Future<Interpreter> _loadModelFromByteData() async {
+    try {
+      print('Loading model using ByteData approach...');
+      
+      // Load the asset as ByteData
+      final ByteData assetData = await rootBundle.load('assets/model.tflite');
+      final Uint8List modelBytes = assetData.buffer.asUint8List();
+      
+      print('Model bytes loaded: ${modelBytes.length} bytes');
+      
+      // Create interpreter from bytes
+      return await Interpreter.fromBuffer(modelBytes);
+    } catch (e) {
+      print('ByteData loading failed: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> _testModelInference() async {
+    if (_interpreter == null) return;
+    
+    try {
+      // Create a dummy input tensor with the expected shape
+      final inputShape = _interpreter!.getInputTensor(0).shape;
+      final input = List.generate(
+        inputShape.reduce((a, b) => a * b),
+        (index) => 0.5, // Neutral values
+      ).reshape(inputShape);
+      
+      final outputShape = _interpreter!.getOutputTensor(0).shape;
+      final output = List.filled(
+        outputShape.reduce((a, b) => a * b),
+        0.0,
+      ).reshape(outputShape);
+      
+      // Run a test inference
+      _interpreter!.run(input, output);
+      print('Test inference successful');
+    } catch (e) {
+      print('Test inference failed: $e');
+      throw Exception('Model failed test inference: $e');
+    }
+  }
+
+  void _showRetryOption() {
+    if (!mounted) return;
+    
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('Model Loading Failed'),
+          content: const Text(
+            'The AI model failed to load. This can happen due to:\n\n'
+            '• Memory limitations\n'
+            '• Temporary system issues\n'
+            '• Asset loading conflicts\n\n'
+            'Would you like to retry loading the model?'
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _loadModel();
+              },
+              child: const Text('Retry'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // Method to force garbage collection and free memory
+  Future<void> _forceMemoryCleanup() async {
+    try {
+      // Close interpreter if exists
+      _interpreter?.close();
+      _interpreter = null;
+      
+      // Wait for cleanup
+      await Future.delayed(const Duration(milliseconds: 300));
+      
+      print('Memory cleanup forced');
+    } catch (e) {
+      print('Error during memory cleanup: $e');
     }
   }
 
@@ -136,47 +349,113 @@ class _DetectScreenState extends State<DetectScreen> {
   }
 
   Future<void> _runModelOnImage(File image) async {
-    if (_interpreter == null) {
+    print('=== Starting model inference ===');
+    print('Model loaded status: $_isModelLoaded');
+    print('Interpreter null status: ${_interpreter == null}');
+    
+    if (_interpreter == null || !_isModelLoaded) {
       setState(() {
-        _result = 'Model not loaded properly';
+        _result = 'Model not loaded properly. Please retry loading the model.';
         _isLoading = false;
         _resultColor = Colors.red;
       });
+      _showRetryOption();
       return;
     }
 
+    Uint8List? imageBytes;
+    img.Image? decodedImage;
+    img.Image? resizedImage;
+    
     try {
+      print('Reading image file...');
       // Read and decode image
-      final imageBytes = await image.readAsBytes();
-      final decodedImage = img.decodeImage(imageBytes);
+      imageBytes = await image.readAsBytes();
+      print('Image bytes read: ${imageBytes.length}');
+      
+      decodedImage = img.decodeImage(imageBytes);
+      print('Image decoded: ${decodedImage != null}');
       
       if (decodedImage == null) {
-        throw Exception('Failed to decode image');
+        throw Exception('Failed to decode image. Please try with a different image.');
       }
 
+      print('Resizing image to ${inputSize}x$inputSize...');
       // Resize image to model's expected input size
-      final resizedImage = img.copyResize(
+      resizedImage = img.copyResize(
         decodedImage,
         width: inputSize,
         height: inputSize,
       );
 
+      print('Converting image to input tensor...');
       // Convert image to Float32List normalized to [0,1]
       var input = _imageToByteListFloat32(resizedImage, inputSize);
+      print('Input tensor created: ${input.length} elements');
       
-      // Prepare output buffer - adjust based on your model's output
-      var output = List.filled(1 * 2, 0.0).reshape([1, 2]);
+      // Get the actual model input and output shapes
+      final inputTensor = _interpreter!.getInputTensor(0);
+      final outputTensor = _interpreter!.getOutputTensor(0);
       
-      // Run inference
-      _interpreter!.run(input, output);
+      print('Model input shape: ${inputTensor.shape}');
+      print('Model output shape: ${outputTensor.shape}');
+      print('Model input type: ${inputTensor.type}');
+      print('Model output type: ${outputTensor.type}');
+      
+      // Validate input tensor shape
+      final expectedInputSize = inputTensor.shape[1] * inputTensor.shape[2] * inputTensor.shape[3];
+      if (input.length != expectedInputSize) {
+        throw Exception('Input tensor size mismatch. Expected: $expectedInputSize, Got: ${input.length}');
+      }
+      
+      // Reshape input to match model expectations [1, height, width, channels]
+      var reshapedInput = input.reshape([1, inputSize, inputSize, 3]);
+      print('Input reshaped to: ${reshapedInput}');
+      
+      // Prepare output buffer based on actual output shape
+      final outputShape = outputTensor.shape;
+      var output = List.filled(outputShape.reduce((a, b) => a * b), 0.0).reshape(outputShape);
+      print('Output buffer prepared with shape: $outputShape');
+      
+      // Verify interpreter is still valid before running
+      if (_interpreter == null) {
+        throw Exception('Interpreter became null during processing');
+      }
+      
+      // Validate interpreter state
+      try {
+        _interpreter!.getInputTensor(0);
+        _interpreter!.getOutputTensor(0);
+      } catch (e) {
+        throw Exception('Interpreter is in invalid state: $e');
+      }
+      
+      print('Running model inference...');
+      // Run inference with properly shaped tensors
+      _interpreter!.run(reshapedInput, output);
+      print('Inference completed successfully');
 
-      // Process results
-      double realScore = output[0][0].toDouble();
-      double fakeScore = output[0][1].toDouble();
+      // Process results - handle different output shapes
+      double realScore, fakeScore;
+      
+      if (output.length == 2) {
+        // Direct output [real_score, fake_score]
+        realScore = output[0].toDouble();
+        fakeScore = output[1].toDouble();
+      } else if (output[0] is List && output[0].length == 2) {
+        // Nested output [[real_score, fake_score]]
+        realScore = output[0][0].toDouble();
+        fakeScore = output[0][1].toDouble();
+      } else {
+        throw Exception('Unexpected output format: ${output.runtimeType}, length: ${output.length}');
+      }
+      
+      print('Raw scores - Real: $realScore, Fake: $fakeScore');
 
       // Apply softmax to get probabilities
       double realProb = _softmax(realScore, fakeScore, true);
       double fakeProb = _softmax(realScore, fakeScore, false);
+      print('Probabilities - Real: $realProb, Fake: $fakeProb');
 
       setState(() {
         _isLoading = false;
@@ -188,33 +467,74 @@ class _DetectScreenState extends State<DetectScreen> {
           _resultColor = Colors.red;
         }
       });
+      
+      print('=== Inference completed successfully ===');
 
     } catch (e) {
+      print('=== Inference error occurred ===');
+      print('Error details: $e');
+      print('Error type: ${e.runtimeType}');
+      
       setState(() {
         _isLoading = false;
         _result = 'Error analyzing image: $e';
         _resultColor = Colors.red;
       });
-      print('Inference error: $e');
+      
+      // If it's a model-related error, offer to reload the model
+      if (e.toString().toLowerCase().contains('interpreter') || 
+          e.toString().toLowerCase().contains('model') ||
+          e.toString().toLowerCase().contains('tflite') ||
+          e.toString().toLowerCase().contains('bad state') ||
+          e.toString().toLowerCase().contains('precondition')) {
+        print('Model-related error detected, offering reload option');
+        
+        // Reset model state
+        _isModelLoaded = false;
+        await _forceMemoryCleanup();
+        
+        _showRetryOption();
+      }
+    } finally {
+      // Clear references to help with garbage collection
+      imageBytes = null;
+      decodedImage = null;
+      resizedImage = null;
+      print('Memory cleanup completed');
     }
   }
 
   // Helper method to convert image to normalized Float32List
   Float32List _imageToByteListFloat32(img.Image image, int inputSize) {
-    var convertedBytes = Float32List(1 * inputSize * inputSize * 3);
-    var buffer = Float32List.view(convertedBytes.buffer);
-    int pixelIndex = 0;
-    
-    for (int y = 0; y < inputSize; y++) {
-      for (int x = 0; x < inputSize; x++) {
-        var pixel = image.getPixel(x, y);
-        // Normalize pixel values to [0,1]
-        buffer[pixelIndex++] = (pixel.r / 255.0);
-        buffer[pixelIndex++] = (pixel.g / 255.0);
-        buffer[pixelIndex++] = (pixel.b / 255.0);
+    try {
+      print('Converting image with dimensions: ${image.width}x${image.height}');
+      
+      var convertedBytes = Float32List(1 * inputSize * inputSize * 3);
+      var buffer = Float32List.view(convertedBytes.buffer);
+      int pixelIndex = 0;
+      
+      for (int y = 0; y < inputSize; y++) {
+        for (int x = 0; x < inputSize; x++) {
+          var pixel = image.getPixel(x, y);
+          
+          // Ensure pixel values are valid
+          final r = pixel.r.clamp(0.0, 255.0);
+          final g = pixel.g.clamp(0.0, 255.0);
+          final b = pixel.b.clamp(0.0, 255.0);
+          
+          // Normalize pixel values to [0,1]
+          buffer[pixelIndex++] = r / 255.0;
+          buffer[pixelIndex++] = g / 255.0;
+          buffer[pixelIndex++] = b / 255.0;
+        }
       }
+      
+      print('Image conversion completed. Buffer size: ${convertedBytes.length}');
+      return convertedBytes;
+    } catch (e) {
+      print('Error in image conversion: $e');
+      rethrow;
     }
-    return convertedBytes;
   }
 
   // Apply softmax function for probability calculation
@@ -386,6 +706,28 @@ class _DetectScreenState extends State<DetectScreen> {
                 ),
               ],
             ),
+            
+            // Model reload button (visible when model is not loaded)
+            if (!_isModelLoaded)
+              Padding(
+                padding: const EdgeInsets.only(top: 16),
+                child: ElevatedButton.icon(
+                  onPressed: _isModelLoading ? null : _loadModel,
+                  icon: _isModelLoading 
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.refresh),
+                  label: Text(_isModelLoading ? 'Loading Model...' : 'Reload AI Model'),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 24),
+                    backgroundColor: Colors.orange,
+                    foregroundColor: Colors.white,
+                  ),
+                ),
+              ),
             
             const SizedBox(height: 20),
             
